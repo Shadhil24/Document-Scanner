@@ -1,0 +1,27 @@
+[build-system]
+requires = ["poetry-core>=1.9.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "assesmenttest"  # keep current package folder name to avoid import mismatch
+version = "0.1.0"
+description = "Fast document detector: orientation fix (deskew), quad crop, optional OCR hints."
+authors = ["Shadhil24 <shadhilsirajudheenck@gmail.com>"]
+readme = "README.md"
+packages = [{ include = "assesmenttest" }]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.14"
+opencv-python = "^4.10.0"
+numpy = "^2.1.0"
+pytesseract = "^0.3.10"
+fastapi = "^0.115.0"
+uvicorn = {extras = ["standard"], version = "^0.30.6"}
+pydantic = "^2.9.0"
+python-multipart = "^0.0.9"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.2"
+
+[tool.poetry.scripts]
+scan = "assesmenttest.main:main"
