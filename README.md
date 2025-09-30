@@ -1,5 +1,4 @@
-# assesmenttest
-
+# Document Scanner using OpenCV
 Fast, CPU‑friendly document scanner that:
 - detects the page (passport/ID/doc) as a quadrilateral,
 - deskews to upright orientation,
