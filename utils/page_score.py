@@ -1,6 +1,75 @@
 import cv2
 import numpy as np
 
+# Known long:short aspect ratios for common document types
+_DOCUMENT_ARS = (1.364, 1.414, 1.420, 1.586, 1.75)
+
+
+def _order_quad_pts(quad: np.ndarray) -> tuple:
+    """Lightweight tl/tr/br/bl ordering for internal scoring helpers."""
+    q = quad.astype(np.float32)
+    s = q.sum(axis=1)
+    d = np.diff(q, axis=1).reshape(-1)
+    return q[np.argmin(s)], q[np.argmin(d)], q[np.argmax(s)], q[np.argmax(d)]
+
+
+def _text_line_score(gray: np.ndarray, quad: np.ndarray) -> float:
+    """
+    Warp the quad region to a canonical rectangle and count horizontal
+    gradient peaks (proxy for text lines spread across the document).
+
+    Full documents (IDs, passports) produce 5-15+ spread peaks.
+    A face photo or single embedded image produces 2-4 concentrated peaks.
+    This is the main signal that distinguishes "whole ID card" from
+    "just the photo on the ID card".
+    """
+    try:
+        tl, tr, br, bl = _order_quad_pts(quad)
+        w = float(np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2.0
+        h = float(np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2.0
+        if w < 20 or h < 20:
+            return 0.5
+        scale = 200.0 / max(w, h)
+        Wo = max(int(w * scale), 20)
+        Ho = max(int(h * scale), 20)
+        src = np.array([tl, tr, br, bl], dtype=np.float32)
+        dst = np.float32([[0, 0], [Wo - 1, 0], [Wo - 1, Ho - 1], [0, Ho - 1]])
+        M = cv2.getPerspectiveTransform(src, dst)
+        roi = cv2.warpPerspective(gray, M, (Wo, Ho))
+        gy_map = cv2.Sobel(roi, cv2.CV_32F, 0, 1, ksize=3)
+        proj = np.mean(np.abs(gy_map), axis=1)
+        if proj.max() < 1.0:
+            return 0.5
+        proj = proj / (proj.max() + 1e-6)
+        peaks = sum(
+            1 for i in range(1, len(proj) - 1)
+            if proj[i] > proj[i - 1] and proj[i] > proj[i + 1] and proj[i] > 0.22
+        )
+        # Face photo: ~2-4 peaks; full document: 5+ peaks
+        return float(np.clip((peaks - 2) / 8.0, 0.0, 1.0))
+    except Exception:
+        return 0.5
+
+
+def _document_ar_score(quad: np.ndarray) -> float:
+    """
+    Small bonus when the quad's aspect ratio matches a known document format
+    (ID-1 card 1.586, A4/passport 1.414, business card 1.75, etc.).
+    Face photos are typically AR 0.7-1.3, so they score near 0 here.
+    """
+    try:
+        tl, tr, br, bl = _order_quad_pts(quad)
+        w = float(np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2.0
+        h = float(np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2.0
+        if min(w, h) < 1e-3:
+            return 0.5
+        ar = max(w, h) / (min(w, h) + 1e-6)
+        min_dist = min(abs(ar - k) for k in _DOCUMENT_ARS)
+        return float(np.clip(1.0 - min_dist / 0.40, 0.0, 1.0))
+    except Exception:
+        return 0.5
+
+
 def _rectangularity(quad: np.ndarray) -> float:
     """Corner angles close to 90° → score near 1."""
     q = quad.astype(np.float32)
@@ -50,17 +119,38 @@ def _area_ratio(quad: np.ndarray, shape) -> float:
         return float(u / (r + 1e-6))
     return 1.0
 
-def _border_contrast(gray: np.ndarray, quad: np.ndarray, delta: int = 6) -> float:
-    """Mean intensity contrast just inside vs outside the quad border."""
+def _border_contrast(gray: np.ndarray, quad: np.ndarray, delta: int = 8) -> float:
+    """
+    Contrast at the quad border: takes the maximum of two complementary signals.
+
+    1. Intensity gap  — classic bright-doc-on-dark-background signal.
+    2. Gradient-ring  — checks whether the gradient magnitude is elevated AT
+       the document boundary vs inside the document interior.  This fires even
+       when the background and document have similar luminance (e.g. white paper
+       on a light-grey desk) because the physical paper edge still creates a
+       local gradient transition.
+    """
     mask = np.zeros_like(gray)
     cv2.fillConvexPoly(mask, quad.astype(np.int32), 255)
-    dil = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (delta, delta)))
-    er = cv2.erode(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (delta, delta)))
-    ring_out = cv2.bitwise_and(dil, cv2.bitwise_not(mask))
-    ring_in = cv2.bitwise_and(mask, cv2.bitwise_not(er))
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (delta, delta))
+    dil = cv2.dilate(mask, k)
+    er  = cv2.erode(mask, k)
+    ring_out    = cv2.bitwise_and(dil, cv2.bitwise_not(mask))
+    ring_in     = cv2.bitwise_and(mask, cv2.bitwise_not(er))
+    border_ring = cv2.bitwise_and(dil, cv2.bitwise_not(er))  # thin strip straddling border
+
     m_out = cv2.mean(gray, ring_out)[0]
-    m_in = cv2.mean(gray, ring_in)[0]
-    return float(min(1.0, abs(m_in - m_out) / 50.0))
+    m_in  = cv2.mean(gray, ring_in)[0]
+    intensity_score = float(min(1.0, abs(m_in - m_out) / 50.0))
+
+    gx  = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gys = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gys)
+    b_mag = cv2.mean(mag, border_ring)[0]
+    i_mag = float(cv2.mean(mag, er)[0]) if np.any(er) else 1.0
+    gradient_score = float(min(1.0, b_mag / (i_mag + 5.0)))
+
+    return float(max(intensity_score, 0.6 * gradient_score))
 
 # -------- NEW: mild MRZ-band bonus for passport ID pages --------
 def _mrz_band_score(gray: np.ndarray) -> float:
@@ -141,16 +231,31 @@ def _texture_gap_score(gray: np.ndarray, quad: np.ndarray, delta=6) -> float:
 
 def composite_score(gray: np.ndarray, edges: np.ndarray, quad: np.ndarray) -> float:
     """
-    Final score in [0..1] combining geometry and simple photometric checks.
-    We keep MRZ weight small to avoid overfitting to passports.
+    Final score in [0..1] combining geometry and photometric checks.
+
+    Weight breakdown (must sum to 1.0):
+      w_rect  — corner angles close to 90°
+      w_edge  — edge pixels along perimeter
+      w_area  — prefer mid-range document coverage
+      w_con   — border contrast (intensity + gradient)
+      w_mrz   — MRZ text-band bonus (passports)
+      w_text  — horizontal text-line peaks in warped region  ← helps reject face photos
+      w_ar    — aspect ratio close to known document formats ← helps reject face photos
     """
-    w_rect, w_edge, w_area, w_con, w_mrz = 0.30, 0.35, 0.10, 0.15, 0.10
-    # w_rect, w_edge, w_area, w_con, w_mrz = 0.30, 0.35, 0.12, 0.15, 0.08
+    w_rect = 0.25
+    w_edge = 0.28
+    w_area = 0.10
+    w_con  = 0.15
+    w_mrz  = 0.05
+    w_text = 0.12
+    w_ar   = 0.05
     s = (
         w_rect * _rectangularity(quad) +
         w_edge * _edge_support(edges, quad) +
         w_area * _area_ratio(quad, gray.shape) +
         w_con  * _border_contrast(gray, quad) +
-        w_mrz  * _mrz_band_score(gray)
+        w_mrz  * _mrz_band_score(gray) +
+        w_text * _text_line_score(gray, quad) +
+        w_ar   * _document_ar_score(quad)
     )
     return float(max(0.0, min(1.0, s)))

@@ -1,0 +1,27 @@
+services:
+  doc-scanner-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: document-scanner:latest
+    container_name: doc-scanner-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./outputs_api:/app/outputs_api
+      - ./data:/app/data
+    restart: unless-stopped
+
+  flask-ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    image: document-scanner-ui:latest
+    container_name: document-scanner-ui
+    ports:
+      - "5000:5000"
+    environment:
+      - BACKEND_URL=http://doc-scanner-api:8000
+    depends_on:
+      - doc-scanner-api
+    restart: unless-stopped

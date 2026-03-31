@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Document Scanner UI</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --panel-2: #1f2937;
+      --txt: #e5e7eb;
+      --muted: #9ca3af;
+      --brand: #3b82f6;
+      --ok: #22c55e;
+      --bad: #ef4444;
+      --line: #374151;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, Segoe UI, Arial, sans-serif;
+      background: radial-gradient(circle at top, #1e293b, var(--bg));
+      color: var(--txt);
+      min-height: 100vh;
+    }
+    .container { max-width: 1080px; margin: 0 auto; padding: 24px; }
+    .title { margin: 0 0 4px; font-size: 30px; }
+    .subtitle { margin: 0 0 18px; color: var(--muted); }
+    .card {
+      background: rgba(17, 24, 39, 0.95);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 18px;
+      margin-bottom: 16px;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.3);
+    }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .mode-btn {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--txt);
+      border-radius: 999px;
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .mode-btn.active { border-color: var(--brand); background: #1d4ed8; }
+    .input-block { margin-top: 14px; }
+    .hidden { display: none; }
+    input[type="file"] {
+      width: 100%;
+      color: var(--txt);
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+    }
+    label { color: var(--muted); font-size: 14px; }
+    button[type="submit"] {
+      margin-top: 12px;
+      background: linear-gradient(135deg, #2563eb, #3b82f6);
+      color: white;
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 16px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .file-list { margin-top: 10px; color: var(--muted); font-size: 13px; }
+    .error { color: #fecaca; background: #7f1d1d; border: 1px solid #b91c1c; padding: 10px; border-radius: 10px; }
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .pill { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 8px; }
+    .ok { color: var(--ok); font-weight: 700; }
+    .bad { color: var(--bad); font-weight: 700; }
+    img { max-width: 100%; border: 1px solid var(--line); border-radius: 10px; margin-top: 8px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: left; font-size: 14px; }
+    th { color: var(--muted); font-weight: 600; }
+    .pair-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 10px;
+    }
+    .img-pane { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 8px; }
+    .img-title { margin: 0 0 8px; font-size: 13px; color: var(--muted); }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    .btn-link {
+      display: inline-block;
+      background: #0b5ed7;
+      color: white;
+      text-decoration: none;
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1 class="title">Document Scanner</h1>
+    <p class="subtitle">Upload a single file or an entire folder. FastAPI handles processing, this page is your Flask UI.</p>
+
+    <div class="card">
+      <form method="post" action="/scan" enctype="multipart/form-data" id="scanForm">
+        <input type="hidden" id="modeInput" name="mode" value="{{ mode or 'file' }}">
+
+        <div class="row">
+          <button class="mode-btn" id="modeFileBtn" type="button">Single File</button>
+          <button class="mode-btn" id="modeFolderBtn" type="button">Folder</button>
+          <label><input type="checkbox" name="use_ocr"> Use OCR orientation hint</label>
+        </div>
+
+        <div id="fileBlock" class="input-block">
+          <input type="file" id="fileInput" name="file" accept="image/*">
+          <div class="file-list" id="fileList"></div>
+        </div>
+
+        <div id="folderBlock" class="input-block hidden">
+          <input type="file" id="folderInput" name="files" accept="image/*" webkitdirectory directory multiple>
+          <div class="file-list" id="folderList"></div>
+        </div>
+
+        <button type="submit">Start Scan</button>
+      </form>
+    </div>
+
+    {% if error %}
+      <div class="card"><div class="error">{{ error }}</div></div>
+    {% endif %}
+
+    {% if result and result.mode == "file" %}
+      <div class="card">
+        <h2>Single File Result</h2>
+        {% if result.filename %}<p class="subtitle">File: {{ result.filename }}</p>{% endif %}
+        <div class="meta">
+          <div class="pill">Accepted: <span class="{{ 'ok' if result.meta.accepted else 'bad' }}">{{ result.meta.accepted }}</span></div>
+          <div class="pill">Score: {{ result.meta.score }}</div>
+          <div class="pill">Angle: {{ result.meta.angle }}</div>
+          <div class="pill">Route: {{ result.meta.route }}</div>
+          <div class="pill">Elapsed: {{ result.meta.elapsed_ms }} ms</div>
+        </div>
+        <div class="pair-grid">
+          <div class="img-pane">
+            <p class="img-title">Uploaded Image</p>
+            {% if result.input_b64 %}
+              <img src="data:image/jpeg;base64,{{ result.input_b64 }}" alt="Input image">
+            {% else %}
+              <p class="subtitle">No input preview available.</p>
+            {% endif %}
+          </div>
+          <div class="img-pane">
+            <p class="img-title">Processed Image</p>
+            {% if result.image_b64 %}
+              <img src="data:image/jpeg;base64,{{ result.image_b64 }}" alt="Processed document">
+            {% else %}
+              <p class="subtitle">No processed image produced.</p>
+            {% endif %}
+          </div>
+        </div>
+        {% if result.batch_id %}
+          <div class="actions">
+            <a class="btn-link" href="/download/item/{{ result.batch_id }}/0/input">Download Uploaded</a>
+            {% if result.image_b64 %}
+              <a class="btn-link" href="/download/item/{{ result.batch_id }}/0/output">Download Processed</a>
+            {% endif %}
+            <a class="btn-link" href="/download/batch/{{ result.batch_id }}">Download Both (ZIP)</a>
+          </div>
+        {% endif %}
+      </div>
+    {% endif %}
+
+    {% if result and result.mode == "folder" %}
+      <div class="card">
+        <h2>Folder Result</h2>
+        <p class="subtitle">Accepted {{ result["accepted_count"] }} / {{ result["items"]|length }} images</p>
+        {% if result["batch_id"] %}
+          <div class="actions">
+            <a class="btn-link" href="/download/batch/{{ result['batch_id'] }}">Download All (ZIP)</a>
+          </div>
+        {% endif %}
+        <table>
+          <thead>
+            <tr>
+              <th>File Name</th>
+              <th>Accepted</th>
+              <th>Score</th>
+              <th>Angle</th>
+              <th>Route</th>
+              <th>Elapsed (ms)</th>
+              <th>Downloads</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in result["items"] %}
+            <tr>
+              <td>{{ item.name }}</td>
+              <td><span class="{{ 'ok' if item.meta.accepted else 'bad' }}">{{ item.meta.accepted }}</span></td>
+              <td>{{ item.meta.score }}</td>
+              <td>{{ item.meta.angle }}</td>
+              <td>{{ item.meta.route }}</td>
+              <td>{{ item.meta.elapsed_ms }}</td>
+              <td>
+                <a class="btn-link" href="/download/item/{{ result['batch_id'] }}/{{ item.index }}/input">Input</a>
+                {% if item.output_b64 %}
+                  <a class="btn-link" href="/download/item/{{ result['batch_id'] }}/{{ item.index }}/output">Output</a>
+                {% endif %}
+              </td>
+            </tr>
+            <tr>
+              <td colspan="7">
+                <div class="pair-grid">
+                  <div class="img-pane">
+                    <p class="img-title">Uploaded: {{ item.name }}</p>
+                    {% if item.input_b64 %}
+                      <img src="data:image/jpeg;base64,{{ item.input_b64 }}" alt="Uploaded image">
+                    {% endif %}
+                  </div>
+                  <div class="img-pane">
+                    <p class="img-title">Processed Result</p>
+                    {% if item.output_b64 %}
+                      <img src="data:image/jpeg;base64,{{ item.output_b64 }}" alt="Processed image">
+                    {% else %}
+                      <p class="subtitle">{{ item.error or "No processed image returned for this item." }}</p>
+                    {% endif %}
+                  </div>
+                </div>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  </div>
+
+  <script>
+    const modeInput = document.getElementById("modeInput");
+    const modeFileBtn = document.getElementById("modeFileBtn");
+    const modeFolderBtn = document.getElementById("modeFolderBtn");
+    const fileBlock = document.getElementById("fileBlock");
+    const folderBlock = document.getElementById("folderBlock");
+    const fileInput = document.getElementById("fileInput");
+    const folderInput = document.getElementById("folderInput");
+    const fileList = document.getElementById("fileList");
+    const folderList = document.getElementById("folderList");
+
+    function setMode(mode) {
+      modeInput.value = mode;
+      const isFile = mode === "file";
+      fileBlock.classList.toggle("hidden", !isFile);
+      folderBlock.classList.toggle("hidden", isFile);
+      fileInput.required = isFile;
+      folderInput.required = !isFile;
+      modeFileBtn.classList.toggle("active", isFile);
+      modeFolderBtn.classList.toggle("active", !isFile);
+    }
+
+    fileInput.addEventListener("change", () => {
+      const names = Array.from(fileInput.files || []).map(f => f.name);
+      fileList.textContent = names.length ? `Selected: ${names.join(", ")}` : "";
+    });
+
+    folderInput.addEventListener("change", () => {
+      const files = Array.from(folderInput.files || []);
+      const preview = files.slice(0, 8).map(f => f.webkitRelativePath || f.name);
+      const rest = files.length > 8 ? ` ... +${files.length - 8} more` : "";
+      folderList.textContent = files.length ? `${files.length} files selected: ${preview.join(", ")}${rest}` : "";
+    });
+
+    modeFileBtn.addEventListener("click", () => setMode("file"));
+    modeFolderBtn.addEventListener("click", () => setMode("folder"));
+
+    setMode("{{ mode or 'file' }}");
+  </script>
+</body>
+</html>

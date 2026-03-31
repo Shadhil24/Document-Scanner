@@ -8,8 +8,9 @@ from utils.preprocess import resize_long, to_gray, illum_normalize
 from utils.edge_detect import canny_percentile, morph_close_then_dilate, kill_border
 from utils.quad_detect import (
     find_quads_by_contours,
-    quad_from_hough,           # updated to accept tiny=True/False
-    quad_from_bright_page,     # new bright-page route
+    quad_from_hough,
+    quad_from_bright_page,
+    quad_from_frame_fill,
     order_quad,
 )
 from utils.page_score import (
@@ -17,8 +18,9 @@ from utils.page_score import (
     _edge_polarity_score,      # self-check
     _texture_gap_score,        # self-check
     _rectangularity,           # self-check
+    _text_line_score,          # inner-photo rejection gate
 )
-from utils.warp_and_pad import warp_perspective_from_quad, add_padding
+from utils.warp_and_pad import warp_perspective_from_quad, add_padding, trim_warped_background
 from utils.orientation import rotation_from_quad, ocr_orientation
 from utils.retry_policy import build_retry_configs
 from utils.vis_debug import draw_quad, save_step
@@ -42,6 +44,9 @@ DEFAULTS = dict(
     CLAHE_CLIP=3.0,
     DESKEW_CLAMP_DEG=12.0,
     SCORE_MIN_ACCEPT=0.58,
+    TRIM_WARP_BG=True,
+    # If True, run Tesseract OSD whenever use_ocr is on (not only on low-confidence passes).
+    OCR_ALWAYS=False,
 )
 
 cv2.setUseOptimized(True)
@@ -49,6 +54,38 @@ try:
     cv2.setNumThreads(max(1, os.cpu_count() or 1))
 except Exception:
     pass
+
+
+def _quad_mostly_inside(inner: np.ndarray, outer: np.ndarray) -> bool:
+    """True when inner quad is largely inside outer quad."""
+    poly = outer.astype(np.int32)
+    inside = 0
+    for pt in inner.astype(np.float32):
+        if cv2.pointPolygonTest(poly, (float(pt[0]), float(pt[1])), False) >= 0:
+            inside += 1
+    cx = float(np.mean(inner[:, 0]))
+    cy = float(np.mean(inner[:, 1]))
+    if cv2.pointPolygonTest(poly, (cx, cy), False) >= 0:
+        inside += 1
+    return inside >= 4
+
+
+def _suppress_inner_quads(quads):
+    """Drop candidates enclosed by a significantly larger candidate."""
+    if len(quads) <= 1:
+        return quads
+    keep = [True] * len(quads)
+    areas = [float(cv2.contourArea(q.astype(np.int32))) for q in quads]
+    for i in range(len(quads)):
+        if not keep[i]:
+            continue
+        for j in range(len(quads)):
+            if i == j or not keep[i]:
+                continue
+            if areas[j] > 1.20 * areas[i] and _quad_mostly_inside(quads[i], quads[j]):
+                keep[i] = False
+                break
+    return [q for q, k in zip(quads, keep) if k]
 
 
 # ------------------ Core pipeline ------------------
@@ -106,6 +143,17 @@ def process_once(img_bgr, cfg, use_ocr=False, debug_dir=None):
             quads = [q]
             route_used = 'bright_page'
 
+    # fallback #3: frame-fill — document fills entire frame, no visible border
+    # Triggers when the image centre is bright + textured but no quad found above.
+    if not quads:
+        q = quad_from_frame_fill(gray)
+        if q is not None:
+            quads = [q]
+            route_used = 'frame_fill'
+
+    # 4.1) Remove inner candidates (photo box inside ID card, etc.)
+    quads = _suppress_inner_quads(quads)
+
     # 5) Pick best quad by score
     best = None
     best_score = -1.0
@@ -116,17 +164,37 @@ def process_once(img_bgr, cfg, use_ocr=False, debug_dir=None):
 
     accepted = best is not None and best_score >= cfg['SCORE_MIN_ACCEPT']
 
+    # 5.05) Guardrail against selecting inner photo rectangles.
+    # If candidate has weak text-line structure and is relatively small, reject it.
+    if best is not None and accepted:
+        H, W = gray.shape[:2]
+        area_frac = cv2.contourArea(best.astype(np.int32)) / float(H * W + 1e-6)
+        tscore = _text_line_score(gray, best)
+        if area_frac < 0.45 and tscore < 0.20:
+            accepted = False
+
     # 5.1) Self-check for fallback routes (photometric sanity)
-    if best is not None and route_used in ('hough', 'bright_page', 'minrect'):
+    if best is not None and route_used in ('hough', 'bright_page', 'frame_fill', 'minrect'):
         pol = _edge_polarity_score(gray, best)
         tex = _texture_gap_score(gray, best)
         rect = _rectangularity(best)
-        if (pol < 0.35) or (tex < 0.35) or (rect < 0.65):
+        # frame_fill quads cover the whole image so polarity/texture gap is
+        # naturally weak — use a relaxed threshold for that route only
+        pol_thr = 0.20 if route_used == 'frame_fill' else 0.35
+        tex_thr = 0.20 if route_used == 'frame_fill' else 0.35
+        if (pol < pol_thr) or (tex < tex_thr) or (rect < 0.65):
             accepted = False
 
     # 6) OCR orientation fallback (optional)
     ocr_angle = None
-    if use_ocr and (not accepted or best_score < cfg['SCORE_MIN_ACCEPT'] + 0.1):
+    ocr_ran = False
+    ocr_gate = False
+    if use_ocr and (
+        cfg.get('OCR_ALWAYS', False)
+        or (not accepted or best_score < cfg['SCORE_MIN_ACCEPT'] + 0.1)
+    ):
+        ocr_gate = True
+        ocr_ran = True
         ocr_angle = ocr_orientation(gray)
 
     # Overlay for debug
@@ -149,11 +217,13 @@ def process_once(img_bgr, cfg, use_ocr=False, debug_dir=None):
                 # keep 'accepted' False here; self-check for fallbacks will run below
 
         # run self-check again if we changed best
-        if best is not None and route_used in ('hough', 'bright_page', 'minrect'):
+        if best is not None and route_used in ('hough', 'bright_page', 'frame_fill', 'minrect'):
             pol = _edge_polarity_score(gray, best)
             tex = _texture_gap_score(gray, best)
             rect = _rectangularity(best)
-            if (pol < 0.35) or (tex < 0.35) or (rect < 0.65):
+            pol_thr = 0.20 if route_used == 'frame_fill' else 0.35
+            tex_thr = 0.20 if route_used == 'frame_fill' else 0.35
+            if (pol < pol_thr) or (tex < tex_thr) or (rect < 0.65):
                 accepted = False
 
     if best is None:
@@ -171,11 +241,34 @@ def process_once(img_bgr, cfg, use_ocr=False, debug_dir=None):
         angle_from_quad = np.sign(angle_from_quad) * cfg['DESKEW_CLAMP_DEG']
 
     final_angle = angle_from_quad
+    ocr_applied = False
     if ocr_angle is not None and abs(ocr_angle) <= 90:
         if abs(ocr_angle - angle_from_quad) < 30 or best_score < cfg['SCORE_MIN_ACCEPT'] + 0.05:
             final_angle = ocr_angle
+            ocr_applied = True
 
     warped = warp_perspective_from_quad(img_small, quad_ord)
+    # Keep saved image and returned metadata in sync: apply the selected final angle.
+    if abs(final_angle) > 0.01:
+        h, w = warped.shape[:2]
+        center = (w / 2.0, h / 2.0)
+        M = cv2.getRotationMatrix2D(center, final_angle, 1.0)
+        cos = abs(M[0, 0])
+        sin = abs(M[0, 1])
+        new_w = int((h * sin) + (w * cos))
+        new_h = int((h * cos) + (w * sin))
+        M[0, 2] += (new_w / 2.0) - center[0]
+        M[1, 2] += (new_h / 2.0) - center[1]
+        warped = cv2.warpAffine(
+            warped,
+            M,
+            (new_w, new_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(255, 255, 255),
+        )
+    if cfg.get('TRIM_WARP_BG', True):
+        warped = trim_warped_background(warped)
     padded = add_padding(warped, pad_frac=cfg['PAD_FRAC'], pad_color=255)
 
     elapsed = round(1000*(time.time()-t0), 1)
@@ -187,12 +280,29 @@ def process_once(img_bgr, cfg, use_ocr=False, debug_dir=None):
         elapsed_ms=elapsed,
         scale=round(float(scale), 4),
     )
+    if use_ocr:
+        info["ocr_meta"] = dict(
+            user_enabled=True,
+            gate_passed=ocr_gate,
+            osd_ran=ocr_ran,
+            osd_deg=None if ocr_angle is None else round(float(ocr_angle), 2),
+            quad_deg=round(float(angle_from_quad), 2),
+            applied=ocr_applied,
+            note=(
+                "OCR orientation skipped: set DEFAULTS OCR_ALWAYS=True or lower acceptance so gate opens."
+                if use_ocr and not ocr_gate
+                else None
+            ),
+        )
     return padded, info
 
 
 # ------------------ Wrapper for file input ------------------
 def process_image_path(path, out_dir, use_ocr=False, debug=False, cfg_overrides=None):
     cfg = DEFAULTS.copy()
+    if os.environ.get("OCR_ALWAYS", "").lower() in ("1", "true", "yes"):
+        cfg = dict(cfg)
+        cfg["OCR_ALWAYS"] = True
     if cfg_overrides:
         cfg.update(cfg_overrides)
 

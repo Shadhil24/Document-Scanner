@@ -34,7 +34,42 @@ def find_quads_by_contours(edges: np.ndarray,
             continue
         quads.append(q)
     quads.sort(key=lambda q: cv2.contourArea(q.astype(np.int32)), reverse=True)
+
+    # Remove quads that are geometrically enclosed inside a significantly larger quad.
+    # Prevents inner regions (e.g. face photo inside an ID card) from winning over
+    # the full document when both are detected.
+    if len(quads) > 1:
+        dominated = [False] * len(quads)
+        for i in range(len(quads)):
+            if dominated[i]:
+                continue
+            area_i = cv2.contourArea(quads[i].astype(np.int32))
+            for j in range(len(quads)):
+                if i == j or dominated[j]:
+                    continue
+                area_j = cv2.contourArea(quads[j].astype(np.int32))
+                if area_j > area_i * 1.25 and _mostly_inside(quads[i], quads[j]):
+                    dominated[i] = True
+                    break
+        quads = [q for q, d in zip(quads, dominated) if not d]
+
     return quads
+
+
+def _mostly_inside(inner: np.ndarray, outer: np.ndarray) -> bool:
+    """Return True when inner quad's 4 corners + centroid are mostly inside outer quad."""
+    poly = outer.astype(np.int32)
+    inside = 0
+    for pt in inner.astype(np.float32):
+        if cv2.pointPolygonTest(poly, (float(pt[0]), float(pt[1])), False) >= 0:
+            inside += 1
+    cx = float(np.mean(inner[:, 0]))
+    cy = float(np.mean(inner[:, 1]))
+    if cv2.pointPolygonTest(poly, (cx, cy), False) >= 0:
+        inside += 1
+    # 4 of 5 test points (4 corners + centroid) must be inside
+    return inside >= 4
+
 
 def order_quad(pts: np.ndarray) -> np.ndarray:
     """Return points in (tl, tr, br, bl) order."""
@@ -160,3 +195,25 @@ def quad_from_bright_page(gray: np.ndarray):
             q = cv2.boxPoints(rect).astype(np.float32)
 
     return q
+
+
+def quad_from_frame_fill(gray: np.ndarray, margin_frac: float = 0.015) -> np.ndarray | None:
+    """
+    Fallback for zoomed documents that fill the entire frame with no visible border.
+    Only activates when the image centre is bright enough and textured enough to
+    look like a document page (not a dark scene or blank shot).
+    Returns a near-full-frame quad with a small inset margin, or None.
+    """
+    H, W = gray.shape[:2]
+    y0, y1 = H // 4, 3 * H // 4
+    x0, x1 = W // 4, 3 * W // 4
+    centre = gray[y0:y1, x0:x1]
+    mean_v = float(np.mean(centre))
+    std_v  = float(np.std(centre))
+    if mean_v < 100 or std_v < 8:
+        return None
+    m = max(2, int(margin_frac * min(H, W)))
+    return np.array(
+        [[m, m], [W - m, m], [W - m, H - m], [m, H - m]],
+        dtype=np.float32,
+    )

@@ -2,14 +2,14 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 import uvicorn
 import os, io, json, time, shutil
-import cv2
-import numpy as np
+import re
 
 # Pipeline entry: writes output to disk and returns (out_path, info)
 try:
-    from assesmenttest.main import process_image_path
+    from main import process_image_path
 except Exception:
     process_image_path = None
 
@@ -36,6 +36,41 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "outputs_api")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+RETENTION_SECONDS = 24 * 3600
+CLEANUP_INTERVAL_SECONDS = 300
+_last_cleanup_ts = 0.0
+
+
+def _safe_filename(name: str | None) -> str:
+    base = os.path.basename(name or "input.jpg")
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+    return base or "input.jpg"
+
+
+def _save_upload_sync(upload: UploadFile, path: str) -> None:
+    with open(path, "wb") as f:
+        shutil.copyfileobj(upload.file, f)
+
+
+def _cleanup_old_files_sync(folder: str, older_than_seconds: int) -> None:
+    cutoff = time.time() - float(older_than_seconds)
+    for entry in os.scandir(folder):
+        if entry.is_file() and entry.stat().st_mtime < cutoff:
+            try:
+                os.remove(entry.path)
+            except OSError:
+                pass
+
+
+async def _maybe_cleanup() -> None:
+    global _last_cleanup_ts
+    now = time.time()
+    if now - _last_cleanup_ts < CLEANUP_INTERVAL_SECONDS:
+        return
+    _last_cleanup_ts = now
+    await run_in_threadpool(_cleanup_old_files_sync, UPLOAD_DIR, RETENTION_SECONDS)
+    await run_in_threadpool(_cleanup_old_files_sync, OUTPUT_DIR, RETENTION_SECONDS)
+
 @app.get("/health")
 def health():
     return {"status": "ok", "time": time.time()}
@@ -52,15 +87,17 @@ async def scan_json(
     Returns only metadata (no file paths).
     """
     if process_image_path is None:
-        return JSONResponse(status_code=500, content={"error": "assesmenttest.main.process_image_path not found"})
+        return JSONResponse(status_code=500, content={"error": "main.process_image_path not found"})
 
+    await _maybe_cleanup()
     ts = int(time.time() * 1000)
-    in_name = f"{ts}_{file.filename}"
+    in_name = f"{ts}_{_safe_filename(file.filename)}"
     in_path = os.path.join(UPLOAD_DIR, in_name)
-    with open(in_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    await run_in_threadpool(_save_upload_sync, file, in_path)
 
-    _, info = process_image_path(in_path, OUTPUT_DIR, use_ocr=use_ocr, debug=debug)
+    _, info = await run_in_threadpool(
+        process_image_path, in_path, OUTPUT_DIR, use_ocr, debug
+    )
     # Do not expose any saved paths
     return {"meta": info}
 
@@ -76,16 +113,18 @@ async def scan_batch_json(
     Returns a list of { name, meta } without any file paths.
     """
     if process_image_path is None:
-        return JSONResponse(status_code=500, content={"error": "assesmenttest.main.process_image_path not found"})
+        return JSONResponse(status_code=500, content={"error": "main.process_image_path not found"})
 
+    await _maybe_cleanup()
     results = []
     ts = int(time.time() * 1000)
     for idx, uf in enumerate(files):
-        in_name = f"{ts}_{idx}_{uf.filename}"
+        in_name = f"{ts}_{idx}_{_safe_filename(uf.filename)}"
         in_path = os.path.join(UPLOAD_DIR, in_name)
-        with open(in_path, "wb") as f:
-            shutil.copyfileobj(uf.file, f)
-        _, info = process_image_path(in_path, OUTPUT_DIR, use_ocr=use_ocr, debug=debug)
+        await run_in_threadpool(_save_upload_sync, uf, in_path)
+        _, info = await run_in_threadpool(
+            process_image_path, in_path, OUTPUT_DIR, use_ocr, debug
+        )
         results.append({"name": uf.filename, "meta": info})
     return results
 
@@ -101,15 +140,17 @@ async def scan_download(
     No paths are exposed; meta returned in headers.
     """
     if process_image_path is None:
-        return JSONResponse(status_code=500, content={"error": "assesmenttest.main.process_image_path not found"})
+        return JSONResponse(status_code=500, content={"error": "main.process_image_path not found"})
 
+    await _maybe_cleanup()
     ts = int(time.time() * 1000)
-    safe_name = f"{ts}_{(file.filename or 'input').replace(chr(10),'_').replace(chr(13),'_')}"
+    safe_name = f"{ts}_{_safe_filename(file.filename)}"
     in_path = os.path.join(UPLOAD_DIR, safe_name)
-    with open(in_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    await run_in_threadpool(_save_upload_sync, file, in_path)
 
-    out_path, info = process_image_path(in_path, OUTPUT_DIR, use_ocr=use_ocr, debug=debug)
+    out_path, info = await run_in_threadpool(
+        process_image_path, in_path, OUTPUT_DIR, use_ocr, debug
+    )
 
     # Even if underlying pipeline failed to find a page, it should still save a best-effort.
     # If for some reason it didn't, return a JSON explanation (still no paths).
@@ -146,15 +187,17 @@ async def scan_angle_only(
     Fast check: returns angle/score/route/timings, no paths.
     """
     if process_image_path is None:
-        return JSONResponse(status_code=500, content={"error": "assesmenttest.main.process_image_path not found"})
+        return JSONResponse(status_code=500, content={"error": "main.process_image_path not found"})
 
+    await _maybe_cleanup()
     ts = int(time.time() * 1000)
-    in_name = f"{ts}_{file.filename}"
+    in_name = f"{ts}_{_safe_filename(file.filename)}"
     in_path = os.path.join(UPLOAD_DIR, in_name)
-    with open(in_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+    await run_in_threadpool(_save_upload_sync, file, in_path)
 
-    _, info = process_image_path(in_path, OUTPUT_DIR, use_ocr=use_ocr, debug=debug)
+    _, info = await run_in_threadpool(
+        process_image_path, in_path, OUTPUT_DIR, use_ocr, debug
+    )
     return {
         "angle": info.get("angle", 0.0),
         "score": info.get("score", 0.0),
@@ -162,6 +205,6 @@ async def scan_angle_only(
         "elapsed_ms": info.get("elapsed_ms", None),
     }
 
-# Local run: python -m assesmenttest.api
+# Local run: python api.py
 if __name__ == "__main__":
-    uvicorn.run("assesmenttest.api:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)

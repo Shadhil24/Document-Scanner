@@ -8,18 +8,12 @@ Fast, CPU‑friendly document scanner that:
 ## Contents
 
 ```
-assesmenttest/
-  api.py                # FastAPI app (POST /scan)
-  main.py               # CLI + core pipeline (process_once)
-  utils/                # helpers: preprocessing, edges, Hough/contours, warp/pad, scoring
-app/
-  main.py               # Alt. API entry (kept for compatibility)
+api.py                  # FastAPI app
+main.py                 # CLI + core pipeline (process_once)
+utils/                  # preprocessing, edges, Hough/contours, warp/pad, scoring
+app/main.py             # Alt. API entry (kept for compatibility)
 data/                   # sample images
 ```
-
-> **Note on package name**: the package folder is **`assesmenttest`** (two 's' after 'a'), and the Poetry
-> project name is set to match. If you previously used `assessmenttest` (with an extra 's'),
-> update imports/commands accordingly.
 
 ## Prereqs
 
@@ -30,32 +24,27 @@ data/                   # sample images
   - macOS: `brew install tesseract`
   - Linux (Debian/Ubuntu): `sudo apt-get install tesseract-ocr`
 
-## Setup (Poetry)
+## Setup (pip)
 
 ```bash
-# From the repo root (where pyproject.toml lives)
-poetry env use 3.12        # or 3.11 / 3.10
-poetry install
+# From the repo root
+python -m venv .venv
+# Linux/macOS
+source .venv/bin/activate
+# Windows PowerShell
+# .\.venv\Scripts\Activate.ps1
+
+pip install -r requirements.txt
 ```
-
-If you only want dependency management (no packaging), you can do:
-
-```toml
-# pyproject.toml
-[tool.poetry]
-package-mode = false
-```
-
-…but packaging is already configured correctly here, so you shouldn't need that.
 
 ## Run the CLI
 
 ```bash
 # Scan a single image
-poetry run scan --input data/image1.jpg --out outputs
+python main.py --input data/image1.jpg --output outputs
 
 # Or an entire folder
-poetry run scan --input data --out outputs
+python main.py --input data --output outputs
 
 # Helpful flags
 # --debug        writes intermediate images to ./debug/<file>/
@@ -70,32 +59,79 @@ Outputs include the cropped/padded image and a sidecar `__meta.json` with:
 
 ```bash
 # dev server
-poetry run uvicorn assesmenttest.api:app --reload --host 0.0.0.0 --port 8000
+uvicorn api:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ### Endpoints
 
-- `GET /` – health & version
+- `GET /health` – health check
 - `POST /scan` – single image upload
-- `POST /batch_scan` – multiple files (form-data)
+- `POST /scan/batch` – multiple files (form-data)
+- `POST /scan/bytes` – image bytes download
+- `POST /scan/angle` – quick angle/score metadata
 
 **Example** (single file):
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/scan"   -F "file=@data/image1.jpg"   -F "use_ocr=false" -F "debug=false" -F "strict_100ms=false" -F "save=true"
+curl -X POST "http://127.0.0.1:8000/scan/angle" \
+  -F "file=@data/image1.jpg" \
+  -F "use_ocr=false" \
+  -F "debug=false"
 ```
 
-The response returns a base64 JPEG and processing metadata. When `save=true` it saves to `./api_outputs/crops`.
+## Run with Docker
+
+Build image:
+
+```bash
+docker build -t document-scanner:latest .
+```
+
+Run API container:
+
+```bash
+docker run --rm -p 8000:8000 \
+  -v "$(pwd)/outputs_api:/app/outputs_api" \
+  -v "$(pwd)/data:/app/data" \
+  document-scanner:latest
+```
+
+PowerShell equivalent:
+
+```powershell
+docker run --rm -p 8000:8000 `
+  -v "${PWD}\outputs_api:/app/outputs_api" `
+  -v "${PWD}\data:/app/data" `
+  document-scanner:latest
+```
+
+Or with Compose:
+
+```bash
+docker compose up --build
+```
+
+Then open:
+
+- Flask UI: `http://127.0.0.1:5000`
+- FastAPI docs: `http://127.0.0.1:8000/docs`
+- FastAPI health: `http://127.0.0.1:8000/health`
+
+### Architecture
+
+- `flask-ui` (port `5000`) is the browser-facing upload UI.
+- `doc-scanner-api` (port `8000`) is the FastAPI backend for scanning.
+- Flask calls FastAPI internally via Docker network (`http://doc-scanner-api:8000`).
 
 ## Common Issues
 
-- **`ModuleNotFoundError: No module named 'cv2'`**: Ensure you are inside the Poetry venv and ran `poetry install` successfully.
-- **Project not installed / script not found**: Run inside the project folder (where `pyproject.toml` is) and use `poetry run scan ...`.
-- **Import errors from `main` or `utils`**: This README ships with fixed package‑relative imports (e.g., `from assesmenttest.main import ...`). Avoid running modules from inside subfolders; run from the project root or install the package in editable mode: `poetry install`.
+- **`ModuleNotFoundError: No module named 'cv2'`**: Ensure your venv is activated and run `pip install -r requirements.txt`.
+- **`uvicorn` not found**: Use `python -m uvicorn api:app --reload --host 0.0.0.0 --port 8000`.
+- **Import errors from `main` or `utils`**: Run commands from the project root so modules resolve correctly.
 
 ## Dev Notes
 
-- Core entry: `assesmenttest/main.py` with `process_once(img_bgr, cfg, ...)`.
+- Core entry: `main.py` with `process_once(img_bgr, cfg, ...)`.
 - Configure speed/quality via the `DEFAULTS` dict in `main.py`.
 - Hough + contour routes with page scoring (`utils/page_score.py`) select the best quad, then we warp & pad.
 - If an image nearly fills the frame (edges cut off), the Hough “bright page” route can accept near‑full quads based on heuristics.
