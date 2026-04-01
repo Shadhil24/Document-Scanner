@@ -63,3 +63,4 @@ jobs:
           file: ./ui/Dockerfile
           push: false
           tags: document-scanner-ui:ci
+
