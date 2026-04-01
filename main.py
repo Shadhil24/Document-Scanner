@@ -21,7 +21,7 @@ from utils.page_score import (
     _text_line_score,          # inner-photo rejection gate
 )
 from utils.warp_and_pad import warp_perspective_from_quad, add_padding, trim_warped_background
-from utils.orientation import rotation_from_quad, ocr_orientation
+from utils.orientation import rotation_from_quad, ocr_orientation_with_confidence
 from utils.retry_policy import build_retry_configs
 from utils.vis_debug import draw_quad, save_step
 
@@ -47,6 +47,7 @@ DEFAULTS = dict(
     TRIM_WARP_BG=True,
     # If True, run Tesseract OSD whenever use_ocr is on (not only on low-confidence passes).
     OCR_ALWAYS=False,
+    OCR_MIN_CONF=8.0,
 )
 
 cv2.setUseOptimized(True)
@@ -86,6 +87,23 @@ def _suppress_inner_quads(quads):
                 keep[i] = False
                 break
     return [q for q, k in zip(quads, keep) if k]
+
+
+def _passes_text_guard(gray: np.ndarray, quad: np.ndarray) -> tuple[bool, float, float]:
+    """
+    Guardrail after contour detection: reject candidates that look like inner
+    photo boxes (small area + weak text-line structure).
+    Returns (pass, text_score, area_frac).
+    """
+    H, W = gray.shape[:2]
+    area_frac = cv2.contourArea(quad.astype(np.int32)) / float(H * W + 1e-6)
+    tscore = _text_line_score(gray, quad)
+    # Stricter text requirement for smaller candidates.
+    if area_frac < 0.35:
+        return (tscore >= 0.26), tscore, area_frac
+    if area_frac < 0.50:
+        return (tscore >= 0.20), tscore, area_frac
+    return True, tscore, area_frac
 
 
 # ------------------ Core pipeline ------------------
@@ -154,23 +172,43 @@ def process_once(img_bgr, cfg, use_ocr=False, debug_dir=None):
     # 4.1) Remove inner candidates (photo box inside ID card, etc.)
     quads = _suppress_inner_quads(quads)
 
-    # 5) Pick best quad by score
-    best = None
-    best_score = -1.0
+    # 5) Pick best quad by score, then enforce text-presence guard.
+    # This explicitly avoids selecting photo boxes inside IDs/passports.
+    scored = []
     for q in quads:
         s = composite_score(gray, edges, q)
-        if s > best_score:
-            best_score, best = s, q
+        text_ok, tscore, area_frac = _passes_text_guard(gray, q)
+        scored.append((s, q, text_ok, tscore, area_frac))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    best = None
+    best_score = -1.0
+    best_text_score = 0.0
+    best_area_frac = 0.0
+    for s, q, text_ok, tscore, area_frac in scored:
+        # For contour-driven candidates, prioritize text-valid regions.
+        if route_used == 'contours' and not text_ok:
+            continue
+        best = q
+        best_score = s
+        best_text_score = tscore
+        best_area_frac = area_frac
+        break
+
+    # If all candidates were filtered out by text guard, fallback to top score.
+    if best is None and scored:
+        s, q, _text_ok, tscore, area_frac = scored[0]
+        best = q
+        best_score = s
+        best_text_score = tscore
+        best_area_frac = area_frac
 
     accepted = best is not None and best_score >= cfg['SCORE_MIN_ACCEPT']
 
     # 5.05) Guardrail against selecting inner photo rectangles.
     # If candidate has weak text-line structure and is relatively small, reject it.
     if best is not None and accepted:
-        H, W = gray.shape[:2]
-        area_frac = cv2.contourArea(best.astype(np.int32)) / float(H * W + 1e-6)
-        tscore = _text_line_score(gray, best)
-        if area_frac < 0.45 and tscore < 0.20:
+        if best_area_frac < 0.50 and best_text_score < 0.20:
             accepted = False
 
     # 5.1) Self-check for fallback routes (photometric sanity)
@@ -187,6 +225,7 @@ def process_once(img_bgr, cfg, use_ocr=False, debug_dir=None):
 
     # 6) OCR orientation fallback (optional)
     ocr_angle = None
+    ocr_conf = None
     ocr_ran = False
     ocr_gate = False
     if use_ocr and (
@@ -195,7 +234,7 @@ def process_once(img_bgr, cfg, use_ocr=False, debug_dir=None):
     ):
         ocr_gate = True
         ocr_ran = True
-        ocr_angle = ocr_orientation(gray)
+        ocr_angle, ocr_conf = ocr_orientation_with_confidence(gray)
 
     # Overlay for debug
     overlay = img_small.copy()
@@ -242,7 +281,8 @@ def process_once(img_bgr, cfg, use_ocr=False, debug_dir=None):
 
     final_angle = angle_from_quad
     ocr_applied = False
-    if ocr_angle is not None and abs(ocr_angle) <= 90:
+    ocr_conf_ok = (ocr_conf is not None and ocr_conf >= cfg.get('OCR_MIN_CONF', 8.0))
+    if ocr_angle is not None and abs(ocr_angle) <= 90 and ocr_conf_ok:
         if abs(ocr_angle - angle_from_quad) < 30 or best_score < cfg['SCORE_MIN_ACCEPT'] + 0.05:
             final_angle = ocr_angle
             ocr_applied = True
@@ -286,12 +326,19 @@ def process_once(img_bgr, cfg, use_ocr=False, debug_dir=None):
             gate_passed=ocr_gate,
             osd_ran=ocr_ran,
             osd_deg=None if ocr_angle is None else round(float(ocr_angle), 2),
+            osd_conf=None if ocr_conf is None else round(float(ocr_conf), 2),
+            min_conf=round(float(cfg.get('OCR_MIN_CONF', 8.0)), 2),
+            conf_ok=bool(ocr_conf_ok),
             quad_deg=round(float(angle_from_quad), 2),
             applied=ocr_applied,
             note=(
                 "OCR orientation skipped: set DEFAULTS OCR_ALWAYS=True or lower acceptance so gate opens."
                 if use_ocr and not ocr_gate
-                else None
+                else (
+                    "OCR orientation ignored: low OSD confidence."
+                    if use_ocr and ocr_gate and not ocr_conf_ok
+                    else None
+                )
             ),
         )
     return padded, info

@@ -123,6 +123,29 @@ Then open:
 - `doc-scanner-api` (port `8000`) is the FastAPI backend for scanning.
 - Flask calls FastAPI internally via Docker network (`http://doc-scanner-api:8000`).
 
+## CI/CD (GitHub Actions)
+
+This repo now includes two workflows:
+
+- `CI` (`.github/workflows/ci.yml`)
+  - Runs on PRs and pushes to `main`
+  - Installs Python deps + `tesseract-ocr`
+  - Runs syntax checks and `pytest`
+  - Verifies Docker build for API and UI images
+
+- `CD` (`.github/workflows/cd.yml`)
+  - Runs on push to `main` (and manual trigger)
+  - Builds and pushes Docker images to GitHub Container Registry (GHCR):
+    - `ghcr.io/<owner>/<repo>/api:latest`
+    - `ghcr.io/<owner>/<repo>/ui:latest`
+    - plus SHA tags
+
+### One-time setup for CD
+
+1. In GitHub repository settings, ensure Actions has permission to write packages.
+2. Keep `GITHUB_TOKEN` enabled for workflows (default in GitHub Actions).
+3. After first push to `main`, verify package visibility in GHCR.
+
 ## Common Issues
 
 - **`ModuleNotFoundError: No module named 'cv2'`**: Ensure your venv is activated and run `pip install -r requirements.txt`.
